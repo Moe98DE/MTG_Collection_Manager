@@ -73,12 +73,10 @@ class CollectionRepository:
     def view_collection_summary(self, filters: dict = None) -> list:
         """
         Queries the collection and returns a summary, grouped by OracleCard name.
-        Dynamically applies filters based on the provided dictionary.
+        Dynamically applies a dictionary of complex filters.
         """
-        if filters is None:
-            filters = {}
+        if filters is None: filters = {}
 
-        # Start with the base query
         query = (
             self.session.query(
                 OracleCard.name, 
@@ -89,17 +87,34 @@ class CollectionRepository:
         )
 
         # --- Dynamic Filter Application ---
-        if 'name' in filters and filters['name']:
-            # .ilike() is a case-insensitive LIKE
-            # The '%' are wildcards, so it matches any part of the name
+        if filters.get('name'):
             query = query.filter(OracleCard.name.ilike(f"%{filters['name']}%"))
         
-        # ** LATER, WE CAN EASILY ADD MORE FILTERS HERE **
-        # Example for a future color filter:
-        # if 'color' in filters and filters['color']:
-        #     query = query.filter(OracleCard.color_identity.contains(filters['color']))
+        if filters.get('type'):
+            query = query.filter(OracleCard.type_line.ilike(f"%{filters['type']}%"))
+        
+        selected_colors = filters.get('colors', [])
+        if selected_colors:
+            # This logic ensures the card's color identity is a SUBSET of the selected colors.
+            # For each color in the card's identity, it must be one of the selected colors.
+            # A card with identity 'W' will match if 'W' or 'WU' is selected.
+            # A card with identity 'WU' will only match if BOTH 'W' and 'U' are selected.
+            for color in ['W', 'U', 'B', 'R', 'G']:
+                if color in selected_colors:
+                    # If user selected this color, we don't care if the card has it or not.
+                    continue
+                else:
+                    # If user did NOT select this color, the card must NOT have it.
+                    query = query.filter(OracleCard.color_identity.notlike(f"%{color}%"))
+            
+            if 'C' in selected_colors:
+                # If colorless is explicitly selected, allow cards with empty color identity
+                pass # This is implicitly handled by the logic above
+        
+        if filters.get('available'):
+            # This is the core logic: only include instances that are NOT assigned to a deck.
+            query = query.filter(CardInstance.deck_id == None)
 
-        # Complete the query
         summary = (
             query
             .group_by(OracleCard.name)

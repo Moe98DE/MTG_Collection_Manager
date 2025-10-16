@@ -265,3 +265,25 @@ class MagicCardService:
                 failure_count += 1
         
         return {"success": success_count, "failure": failure_count}    
+    
+    def export_collection(self, filters: dict = None):
+        """
+        Gets the filtered collection summary, formats it as a list,
+        and copies it to the clipboard.
+        """
+        # We can reuse our existing summary logic!
+        summary_tuples = self.collection_repo.view_collection_summary(filters=filters)
+        
+        if not summary_tuples:
+            print("No cards to export for the current filter.")
+            return
+
+        # Format as "Count Card Name"
+        export_list = [f"{count} {name}" for name, count in summary_tuples]
+        export_string = "\n".join(export_list)
+        
+        try:
+            pyperclip.copy(export_string)
+            print("Filtered collection list copied to clipboard.")
+        except pyperclip.PyperclipException as e:
+            print(f"Error: Could not copy to clipboard. Is a clipboard tool installed? Error: {e}")

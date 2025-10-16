@@ -69,7 +69,8 @@ class ScryfallClient:
                 oracle_id=oracle_id,
                 name=card_data['name'],
                 # Scryfall returns a list like ['W', 'B']. Join it into 'WB'.
-                color_identity=''.join(card_data['color_identity'])
+                color_identity=''.join(card_data['color_identity']),
+                type_line=card_data.get('type_line')
             )
             self.session.add(oracle_card)
             # We need to flush to get the oracle_card.id for the printing foreign key
