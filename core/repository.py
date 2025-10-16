@@ -124,6 +124,23 @@ class CollectionRepository:
             .all()
         )
         return query_result
+    
+    def get_assembled_deck_contents(self, deck_id: int) -> list:
+        """
+        Gets a summary of cards in an assembled deck, grouped by name.
+        """
+        return (
+            self.session.query(
+                OracleCard.name,
+                func.count(CardInstance.id).label("quantity")
+            )
+            .join(CardPrinting, OracleCard.id == CardPrinting.oracle_card_id)
+            .join(CardInstance, CardPrinting.id == CardInstance.printing_id)
+            .filter(CardInstance.deck_id == deck_id)
+            .group_by(OracleCard.name)
+            .order_by(OracleCard.name)
+            .all()
+        )
 
 class DeckRepository:
     def __init__(self, db_session: Session, scryfall_client: ScryfallClient):

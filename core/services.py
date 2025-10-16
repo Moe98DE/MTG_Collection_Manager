@@ -240,3 +240,28 @@ class MagicCardService:
             print(f"Error disassembling deck: {e}")
             self.db_session.rollback()
             return False        
+        
+    def get_assembled_deck_contents(self, deck_id: int) -> List[Dict[str, any]]:
+        """Returns a UI-friendly list of cards in an assembled deck."""
+        results = self.collection_repo.get_assembled_deck_contents(deck_id)
+        return [{"name": name, "quantity": qty} for name, qty in results]
+
+    def add_cards_to_blueprint_from_list(self, deck_id: int, card_list_string: str) -> dict:
+        """Adds multiple cards to a blueprint from a multi-line string."""
+        deck = self.deck_repo.session.get(Deck, deck_id)
+        if not deck:
+            return {"success": 0, "failure": -1} # Indicate deck not found
+
+        success_count = 0
+        failure_count = 0
+        for line in card_list_string.splitlines():
+            line = line.strip()
+            if not line: continue
+            
+            # Reuse the existing single-add logic from the repository
+            if self.deck_repo.add_card_to_blueprint(deck, line):
+                success_count += 1
+            else:
+                failure_count += 1
+        
+        return {"success": success_count, "failure": failure_count}    
