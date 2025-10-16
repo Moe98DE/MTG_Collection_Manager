@@ -157,6 +157,23 @@ class CollectionRepository:
             .all()
         )
 
+    def delete_card_instance(self, instance_id: int) -> bool:
+        """Deletes a single physical card instance from the database."""
+        instance = self.session.get(CardInstance, instance_id)
+        if instance:
+            # Important check: Do not delete if it's part of an assembled deck.
+            if instance.deck_id is not None:
+                print(f"Error: Cannot delete card instance {instance_id} because it is in an assembled deck.")
+                return False
+            
+            self.session.delete(instance)
+            self.session.commit()
+            print(f"Successfully deleted card instance {instance_id}.")
+            return True
+        
+        print(f"Error: Could not find card instance with ID {instance_id} to delete.")
+        return False
+    
 class DeckRepository:
     def __init__(self, db_session: Session, scryfall_client: ScryfallClient):
         self.session = db_session

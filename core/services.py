@@ -32,6 +32,15 @@ class MagicCardService:
             self.db_session.rollback() # Rollback on error to keep DB clean
             return False
 
+    def delete_card_instance(self, instance_id: int) -> bool:
+        """Service layer wrapper for deleting a card instance."""
+        try:
+            return self.collection_repo.delete_card_instance(instance_id)
+        except Exception as e:
+            print(f"An error occurred during card deletion: {e}")
+            self.db_session.rollback()
+            return False
+
     def get_collection_summary(self, filters: dict = None) -> List[Dict[str, any]]:
         """
         Retrieves the collection summary, applying any specified filters.
@@ -63,6 +72,7 @@ class MagicCardService:
                 status = f"⚠️ In '{deck.name}'"
             
             instances_data.append({
+                "instance_id": instance.id,
                 "set_code": printing.set_code.upper(),
                 "collector_number": printing.collector_number,
                 "is_foil": instance.is_foil,

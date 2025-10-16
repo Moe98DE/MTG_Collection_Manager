@@ -81,20 +81,23 @@ class CollectionFrame(ctk.CTkFrame):
                 label.bind("<Button-1>", lambda event, name=card_name: self.show_details_for_card(name))
 
     def show_details_for_card(self, card_name: str):
+        """Creates a new window to show all instances of a specific card."""
         instances = self.service.get_instances_for_oracle_card(card_name)
         if not instances: return
 
         details_window = ctk.CTkToplevel(self)
         details_window.title(f"Details for {card_name}")
-        details_window.geometry("500x300")
+        details_window.geometry("600x400") # A bit wider for the new button
         details_window.transient(self)
         details_window.grid_columnconfigure(0, weight=1)
+        details_window.grid_rowconfigure(0, weight=1)
 
         scroll_frame = ctk.CTkScrollableFrame(details_window, label_text=f"Owned Copies of {card_name}")
         scroll_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-        scroll_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        # Give more weight to the status column
+        scroll_frame.grid_columnconfigure(3, weight=2)
 
-        headers = ["Set", "Number", "Foil", "Status"]
+        headers = ["Set", "Number", "Foil", "Status", "Action"]
         for i, header in enumerate(headers):
             header_label = ctk.CTkLabel(scroll_frame, text=header, font=ctk.CTkFont(weight="bold"))
             header_label.grid(row=0, column=i, padx=5, pady=5)
@@ -103,4 +106,25 @@ class CollectionFrame(ctk.CTkFrame):
             ctk.CTkLabel(scroll_frame, text=instance['set_code']).grid(row=i+1, column=0, padx=5, pady=2)
             ctk.CTkLabel(scroll_frame, text=instance['collector_number']).grid(row=i+1, column=1, padx=5, pady=2)
             ctk.CTkLabel(scroll_frame, text="Yes" if instance['is_foil'] else "No").grid(row=i+1, column=2, padx=5, pady=2)
-            ctk.CTkLabel(scroll_frame, text=instance['status']).grid(row=i+1, column=3, padx=5, pady=2)
+            ctk.CTkLabel(scroll_frame, text=instance['status']).grid(row=i+1, column=3, padx=5, pady=2, sticky="w")
+            
+            # *** NEW: The Delete Button Logic ***
+            delete_button = ctk.CTkButton(
+                scroll_frame, text="Delete", width=60,
+                command=lambda i_id=instance['instance_id']: self.delete_instance_action(i_id, details_window)
+            )
+            
+            # Disable the button if the card is not available
+            if instance['status'] != "✅ Available":
+                delete_button.configure(state="disabled")
+            
+            delete_button.grid(row=i+1, column=4, padx=5, pady=2)
+
+    # ADD this new method to the CollectionFrame class
+    def delete_instance_action(self, instance_id: int, dialog_window: ctk.CTkToplevel):
+        """Handles the click of a delete button in the details view."""
+        print(f"UI: Attempting to delete instance {instance_id}")
+        # In a real app, you would add a confirmation dialog here ("Are you sure?")
+        if self.service.delete_card_instance(instance_id):
+            dialog_window.destroy() # Close the pop-up
+            self.refresh() # Refresh the main collection view
