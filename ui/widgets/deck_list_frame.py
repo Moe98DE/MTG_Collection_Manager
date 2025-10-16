@@ -35,18 +35,17 @@ class DeckListFrame(ctk.CTkFrame):
         decks = self.service.get_all_decks()
         for deck in decks:
             btn = ctk.CTkButton(self.scroll_frame, text=deck['name'],
-                                command=lambda d=deck: self.select_deck(d['id']))
+                                command=lambda d=deck: self.select_deck(d)) # Pass the whole dict
             btn.pack(fill="x", padx=5, pady=2)
         
         # Reset selection if the selected deck was deleted
         if self.selected_deck_id and not any(d['id'] == self.selected_deck_id for d in decks):
             self.select_deck(None)
 
-    def select_deck(self, deck_id):
-        self.selected_deck_id = deck_id
-        self.on_deck_select(deck_id)
-        self.delete_button.configure(state="normal" if deck_id else "disabled")
-        print(f"Selected deck ID: {deck_id}")
+    def select_deck(self, deck_data): # accept the whole dict
+        self.selected_deck_id = deck_data['id'] if deck_data else None
+        self.on_deck_select(deck_data)
+        self.delete_button.configure(state="normal" if deck_data else "disabled")
 
     def delete_selected_deck(self):
         if self.selected_deck_id:

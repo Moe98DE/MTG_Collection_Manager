@@ -182,6 +182,75 @@ class DeckRepository:
         self.session.commit()
         return existing_entry or new_entry # Return the entry that was created/updated
 
+    def update_blueprint_entry_quantity(self, deck_id: int, oracle_card_id: int, new_quantity: int) -> None:
+        """Updates the quantity of a card in a blueprint. Deletes the entry if quantity is 0 or less."""
+        entry = self.session.query(BlueprintEntry).filter_by(
+            deck_id=deck_id,
+            oracle_card_id=oracle_card_id
+        ).first()
+
+        if not entry:
+            print("Error: Could not find blueprint entry to update.")
+            return
+
+        if new_quantity <= 0:
+            self.session.delete(entry)
+            print(f"Removed '{entry.oracle_card.name}' from blueprint.")
+        else:
+            entry.quantity = new_quantity
+            print(f"Updated '{entry.oracle_card.name}' quantity to {new_quantity}.")
+        
+        self.session.commit()
+
+    def assemble_deck(self, deck_id: int, choices: dict) -> bool:
+        """
+        Transitions a deck from Blueprint to Assembled.
+        - Assigns chosen CardInstances to the deck.
+        - Deletes the old blueprint entries.
+        """
+        deck = self.session.get(Deck, deck_id)
+        if not deck or deck.status != DeckStatus.BLUEPRINT:
+            return False
+
+        # Assign instances
+        for instance_id in choices.values():
+            instance = self.session.get(CardInstance, instance_id)
+            if instance:
+                instance.deck_id = deck_id
+
+        # Delete old blueprint entries
+        self.session.query(BlueprintEntry).filter_by(deck_id=deck_id).delete()
+        
+        # Update deck status
+        deck.status = DeckStatus.ASSEMBLED
+        self.session.commit()
+        return True
+
+    def disassemble_deck(self, deck_id: int) -> bool:
+        """
+        Transitions a deck from Assembled to Blueprint.
+        - Frees all associated CardInstances.
+        - Re-creates the blueprint entries based on the cards that were in the deck.
+        """
+        deck = self.session.get(Deck, deck_id)
+        if not deck or deck.status != DeckStatus.ASSEMBLED:
+            return False
+
+        # Re-create blueprint from physical cards
+        card_counts = {}
+        for instance in deck.cards:
+            oracle_id = instance.printing.oracle_card_id
+            card_counts[oracle_id] = card_counts.get(oracle_id, 0) + 1
+            instance.deck_id = None # Free the card instance
+
+        for oracle_id, quantity in card_counts.items():
+            new_entry = BlueprintEntry(deck_id=deck_id, oracle_card_id=oracle_id, quantity=quantity)
+            self.session.add(new_entry)
+
+        deck.status = DeckStatus.BLUEPRINT
+        self.session.commit()
+        return True
+
     def get_all_decks(self) -> list[Deck]:
         """Returns a list of all Deck objects, ordered by name."""
         return self.session.query(Deck).order_by(Deck.name).all()
