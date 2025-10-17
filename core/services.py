@@ -399,24 +399,34 @@ class MagicCardService:
         return [{"name": name, "quantity": qty} for name, qty in results]
 
     def add_cards_to_blueprint_from_list(self, deck_id: int, card_list_string: str) -> dict:
-        """Adds multiple cards to a blueprint from a multi-line string."""
-        deck = self.deck_repo.session.get(Deck, deck_id)
-        if not deck:
-            return {"success": 0, "failure": -1} # Indicate deck not found
+        """
+                Adds multiple cards to a blueprint from a multi-line string in a single transaction.
+                """
+        lines = card_list_string.splitlines()
 
-        success_count = 0
-        failure_count = 0
-        for line in card_list_string.splitlines():
-            line = line.strip()
-            if not line: continue
-            
-            # Reuse the existing single-add logic from the repository
-            if self.deck_repo.add_card_to_blueprint(deck, line):
-                success_count += 1
-            else:
-                failure_count += 1
-        
-        return {"success": success_count, "failure": failure_count}    
+        try:
+            # The repository method prepares all the changes in the session
+            result = self.deck_repo.add_cards_to_blueprint_transactional(deck_id, lines)
+
+            # The service layer commits the entire transaction
+            self.db_session.commit()
+
+            success_count = len(lines) - len(result["failures"])
+            print(f"Successfully committed {success_count} blueprint changes.")
+
+            return {
+                "success": success_count,
+                "failure": len(result["failures"])
+            }
+
+        except (DeckAssemblyError, CardNotFoundError) as e:
+            print(f"SERVICE LAYER ERROR: {e.message}")
+            self.db_session.rollback()
+            return {"success": 0, "failure": len(lines)}
+        except Exception as e:
+            print(f"A critical error occurred during blueprint update. Rolling back transaction. Error: {e}")
+            self.db_session.rollback()
+            return {"success": 0, "failure": len(lines)}
     
     def export_collection(self, filters: dict = None):
         """

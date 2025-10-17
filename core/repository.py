@@ -349,6 +349,71 @@ class DeckRepository:
         self.session.commit()
         return existing_entry or new_entry # Return the entry that was created/updated
 
+    def add_cards_to_blueprint_transactional(self, deck_id: int, card_lines: List[str]) -> Dict[str, List[str]]:
+        """
+        Processes a list of card strings to add to a blueprint. This method does NOT commit.
+        It efficiently handles aggregating quantities for cards that appear multiple times.
+        """
+        deck = self.session.get(Deck, deck_id)
+        if not deck or deck.status != DeckStatus.BLUEPRINT:
+            raise DeckAssemblyError(f"Deck with ID {deck_id} is not a valid blueprint.")
+
+        failed_lines = []
+        # Step 1: Parse all lines and aggregate quantities in memory
+        card_quantities = {}  # Key: card_name, Value: total_quantity
+        for line in card_lines:
+            line = line.strip()
+            if not line: continue
+
+            parts = line.split(' ', 1)
+            try:
+                quantity = int(parts[0])
+                card_name = parts[1]
+            except (ValueError, IndexError):
+                quantity = 1
+                card_name = parts[0]
+
+            # Use .title() to normalize capitalization, e.g., "sol ring" becomes "Sol Ring"
+            normalized_name = card_name.title()
+            card_quantities[normalized_name] = card_quantities.get(normalized_name, 0) + quantity
+
+        # Step 2: Fetch all relevant data in as few queries as possible
+        all_card_names = list(card_quantities.keys())
+
+        # Find which of these oracle cards and blueprint entries already exist
+        oracle_cards_found = self.session.query(OracleCard).filter(OracleCard.name.in_(all_card_names)).all()
+        oracle_card_map = {card.name: card for card in oracle_cards_found}
+
+        existing_entries = self.session.query(BlueprintEntry).filter(
+            BlueprintEntry.deck_id == deck_id,
+            BlueprintEntry.oracle_card_id.in_([c.id for c in oracle_cards_found])
+        ).all()
+        existing_entry_map = {entry.oracle_card.name: entry for entry in existing_entries}
+
+        # Step 3: Process the aggregated list
+        for name, quantity in card_quantities.items():
+            # Find the OracleCard, fetching from Scryfall if not in our DB yet
+            oracle_card = oracle_card_map.get(name)
+            if not oracle_card:
+                try:
+                    oracle_card = self.scryfall_client.get_oracle_card_by_name(name)
+                    if not oracle_card: raise CardNotFoundError(name)
+                except CardNotFoundError:
+                    print(f"Skipping line due to error: Card not found for '{name}'")
+                    failed_lines.append(name)
+                    continue
+
+            # Check if an entry for this card already exists in the deck
+            if name in existing_entry_map:
+                existing_entry_map[name].quantity += quantity
+                print(f"Prepared update for '{name}' to total quantity {existing_entry_map[name].quantity}.")
+            else:
+                new_entry = BlueprintEntry(deck_id=deck_id, oracle_card_id=oracle_card.id, quantity=quantity)
+                self.session.add(new_entry)
+                print(f"Prepared addition of {quantity}x '{name}'.")
+
+        return {"failures": failed_lines}
+
     def update_blueprint_entry_quantity(self, deck_id: int, oracle_card_id: int, new_quantity: int) -> None:
         """Updates the quantity of a card in a blueprint. Deletes the entry if quantity is 0 or less."""
         entry = self.session.query(BlueprintEntry).filter_by(
@@ -369,7 +434,7 @@ class DeckRepository:
         
         self.session.commit()
 
-        # NEW: A dedicated validation method.
+    # NEW: A dedicated validation method.
     def validate_assembly_choices(self, deck_id: int, chosen_instance_ids: List[int]) -> bool:
         """
         Validates if the user's chosen CardInstances are sufficient and valid for a blueprint.
