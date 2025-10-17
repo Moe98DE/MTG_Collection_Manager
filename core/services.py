@@ -7,8 +7,9 @@ from sqlalchemy import func
 from .exceptions import InvalidInputFormatError, CardNotFoundError, CoreLogicError, DeckAssemblyError
 from .models import SessionLocal
 from .models import CardPrinting, CardInstance, Deck, DeckStatus # Add missing imports
-from .scryfall_client import ScryfallClient
-from .repository import CollectionRepository, DeckRepository
+from core.api.scryfall_client import ScryfallClient
+from core.repo.collection_repository import CollectionRepository
+from core.repo.deck_repository import DeckRepository
 
 
 # NEW: A fully fleshed-out Data Transfer Object for collection summary views

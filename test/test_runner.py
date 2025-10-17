@@ -2,7 +2,7 @@ import os
 from pprint import pprint
 import pyperclip
 
-from core.database_setup import create_database_schema
+from core.repo.database_setup import create_database_schema
 from core.services import MagicCardService
 
 # YOUR PROVIDED TEST DATA - which we now know is 100% valid.

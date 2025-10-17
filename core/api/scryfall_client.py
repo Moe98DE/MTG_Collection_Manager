@@ -2,8 +2,8 @@ import requests
 import time
 from sqlalchemy.orm import Session, joinedload
 
-from .exceptions import CardNotFoundError
-from .models import OracleCard, CardPrinting
+from core.exceptions import CardNotFoundError
+from core.models import OracleCard, CardPrinting
 
 
 class ScryfallClient:
