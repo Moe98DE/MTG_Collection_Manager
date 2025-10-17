@@ -1,11 +1,69 @@
-from typing import List, Dict
+from dataclasses import field, dataclass
+from typing import List, Dict, Optional
 
 import pyperclip
 from sqlalchemy import func
+
+from .exceptions import InvalidInputFormatError, CardNotFoundError, CoreLogicError, DeckAssemblyError
 from .models import SessionLocal
 from .models import CardPrinting, CardInstance, Deck, DeckStatus # Add missing imports
 from .scryfall_client import ScryfallClient
 from .repository import CollectionRepository, DeckRepository
+
+
+# NEW: A fully fleshed-out Data Transfer Object for collection summary views
+@dataclass
+class CollectionSummaryItem:
+    """
+    Represents a single, grouped entry in the user's collection view.
+    This is a Data Transfer Object (DTO) designed to provide all necessary
+    information for a rich UI display in a single object.
+    """
+    # Core identifying information
+    oracle_id: str
+    name: str
+
+    # Key gameplay attributes for sorting and display
+    type_line: str
+    mana_cost: Optional[str]
+    cmc: float
+    color_identity: str
+
+    # User's collection statistics
+    total_owned: int
+    available_count: int
+
+    # Display and aesthetic information
+    # We'll pick the image from the first printing we find for this card.
+    # It provides a good visual representation without complex logic.
+    representative_image_uri: Optional[str]
+
+    # Making keywords a list is much nicer for a frontend to consume than a raw string.
+    keywords: List[str] = field(default_factory=list)
+
+    @staticmethod
+    def from_repository_tuple(repo_tuple) -> 'CollectionSummaryItem':
+        """
+        A factory method to create an instance from the data structure
+        returned by the CollectionRepository.
+        """
+        oracle_card, total, available, image_uri = repo_tuple
+
+        # Split the comma-separated string from the DB back into a list
+        keywords_list = [k.strip() for k in oracle_card.keywords.split(',') if k.strip()]
+
+        return CollectionSummaryItem(
+            oracle_id=oracle_card.id,
+            name=oracle_card.name,
+            type_line=oracle_card.type_line,
+            mana_cost=oracle_card.mana_cost,
+            cmc=oracle_card.cmc,
+            color_identity=oracle_card.color_identity,
+            total_owned=total,
+            available_count=available,
+            representative_image_uri=image_uri,
+            keywords=keywords_list
+        )
 
 class MagicCardService:
     def __init__(self):
@@ -24,34 +82,69 @@ class MagicCardService:
         Adds one or more card instances to the collection from a string.
         Returns True on success, False on failure.
         """
+        # UPDATED: Catch specific exceptions and provide context
         try:
             instances = self.collection_repo.add_card_from_string(card_string)
             return len(instances) > 0
+        except InvalidInputFormatError as e:
+            print(f"SERVICE LAYER ERROR: {e.message}")
+            self.db_session.rollback()
+            return False
+        except CardNotFoundError as e:
+            print(f"SERVICE LAYER ERROR: {e.message}")
+            self.db_session.rollback()
+            return False
         except Exception as e:
-            print(f"An error occurred in add_card_to_collection: {e}")
-            self.db_session.rollback() # Rollback on error to keep DB clean
+            # A general catch-all for unexpected errors
+            print(f"An unexpected error occurred in add_card_to_collection: {e}")
+            self.db_session.rollback()
             return False
 
     def delete_card_instance(self, instance_id: int) -> bool:
         """Service layer wrapper for deleting a card instance."""
+        # UPDATED: Catch our new exceptions
         try:
             return self.collection_repo.delete_card_instance(instance_id)
+        except CoreLogicError as e:  # Catches our custom base exception and its children
+            print(f"SERVICE LAYER ERROR: {e.message}")
+            self.db_session.rollback()
+            return False
         except Exception as e:
-            print(f"An error occurred during card deletion: {e}")
+            print(f"An unexpected error occurred during card deletion: {e}")
             self.db_session.rollback()
             return False
 
-    def get_collection_summary(self, filters: dict = None) -> List[Dict[str, any]]:
+    def update_card_instance(self, instance_id: int, update_data: dict) -> CardInstance | None:
+        """
+        Service layer wrapper for updating a card instance.
+        Returns the updated CardInstance on success, None on failure.
+        """
+        try:
+            # Basic validation: ensure update_data is a non-empty dictionary
+            if not isinstance(update_data, dict) or not update_data:
+                print("SERVICE LAYER ERROR: update_data must be a non-empty dictionary.")
+                return None
+
+            return self.collection_repo.update_card_instance(instance_id, update_data)
+        except (CoreLogicError, ValueError) as e:
+            print(f"SERVICE LAYER ERROR: {e}")
+            self.db_session.rollback()
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred during card update: {e}")
+            self.db_session.rollback()
+            return None
+
+    def get_collection_summary(self, filters: dict = None) -> List[CollectionSummaryItem]:
         """
         Retrieves the collection summary, applying any specified filters.
+        Returns a list of structured CollectionSummaryItem objects.
         """
+        # The repository now returns tuples in the format our DTO expects.
         summary_tuples = self.collection_repo.view_collection_summary(filters=filters)
-        
-        summary_list = [
-            {"name": name, "count": total_owned} 
-            for name, total_owned in summary_tuples
-        ]
-        return summary_list
+
+        # UPDATED: Use the clean factory method for conversion.
+        return [CollectionSummaryItem.from_repository_tuple(t) for t in summary_tuples]
 
     def close_session(self):
         """Closes the database session. Should be called on application exit."""
@@ -83,26 +176,34 @@ class MagicCardService:
     
     def add_cards_from_list(self, card_list_string: str) -> dict:
         """
-        Adds multiple cards to the collection from a multi-line string.
-        Each line is processed individually.
-        Returns a dictionary with success and failure counts.
-        """
-        success_count = 0
-        failure_count = 0
-        
-        # .splitlines() is a robust way to split a string into a list of lines
-        for line in card_list_string.splitlines():
-            line = line.strip()
-            if not line:  # Skip empty lines
-                continue
-            
-            # We can reuse our existing single-add logic!
-            if self.add_card_to_collection(line):
-                success_count += 1
-            else:
-                failure_count += 1
-        
-        return {"success": success_count, "failure": failure_count}
+                Adds multiple cards from a multi-line string in a single, atomic transaction.
+                If any card causes a database-level error, the entire batch is rolled back.
+                Parsing and card-not-found errors for individual lines are skipped and reported.
+
+                Returns a dictionary with success and failure counts.
+                """
+        lines = card_list_string.splitlines()
+
+        try:
+            # The repository method prepares all objects in the session
+            result = self.collection_repo.add_cards_from_list_transactional(lines)
+
+            # If there are any successful objects to add, commit them all at once.
+            if result["successes"]:
+                self.db_session.commit()
+                print(f"Successfully committed {len(result['successes'])} new card instances to the database.")
+
+            return {
+                "success": len(result["successes"]),
+                "failure": len(result["failures"])
+            }
+
+        except Exception as e:
+            # This will catch unexpected errors, like a database connection failure.
+            # It will NOT catch the CardNotFoundError, which is handled inside the repo method.
+            print(f"A critical error occurred during bulk add. Rolling back transaction. Error: {e}")
+            self.db_session.rollback()
+            return {"success": 0, "failure": len(lines)}
     
     def get_all_decks(self) -> List[Dict[str, any]]:
         """Returns a UI-friendly list of all decks."""
@@ -233,12 +334,53 @@ class MagicCardService:
             })
         return options
 
-    def assemble_deck(self, deck_id: int, choices: dict) -> bool:
-        """Service layer wrapper for assembling a deck."""
+    # UPDATED: The service method now orchestrates validation and assembly.
+    # The 'choices' dict from the UI needs to be flattened into a list of instance IDs.
+    def assemble_deck(self, deck_id: int, choices_map: Dict[str, List[int]]) -> bool:
+        """
+        Service layer wrapper for validating and assembling a deck.
+
+        Args:
+            deck_id: The ID of the blueprint deck to assemble.
+            choices_map: A dictionary from the UI, e.g.,
+                         {'oracle_id_1': [instance_id_A, instance_id_B], 'oracle_id_2': [instance_id_C]}
+
+        Returns:
+            True on success, False on failure.
+        """
         try:
-            return self.deck_repo.assemble_deck(deck_id, choices)
+            # 1. Flatten the list of chosen instance IDs from the UI's data structure
+            if not isinstance(choices_map, dict):
+                print("SERVICE LAYER ERROR: Choices must be provided in a dictionary.")
+                return False
+
+            all_chosen_instance_ids = [
+                instance_id for instance_list in choices_map.values() for instance_id in instance_list
+            ]
+
+            if not all_chosen_instance_ids:
+                print("SERVICE LAYER ERROR: No card instances were chosen for assembly.")
+                return False
+
+            # 2. Perform validation BEFORE attempting the database transaction
+            self.deck_repo.validate_assembly_choices(deck_id, all_chosen_instance_ids)
+
+            # 3. If validation passes, proceed with the atomic assembly operation
+            self.deck_repo.assemble_deck(deck_id, all_chosen_instance_ids)
+
+            # The service layer is responsible for the final commit
+            self.db_session.commit()
+            print("Assembly transaction committed successfully.")
+            return True
+
+        except DeckAssemblyError as e:
+            # Catch our specific, expected errors from the validation/assembly process
+            print(f"SERVICE LAYER ERROR: Could not assemble deck. Reason: {e.message}")
+            self.db_session.rollback()  # Ensure rollback just in case
+            return False
         except Exception as e:
-            print(f"Error assembling deck: {e}")
+            # Catch any other unexpected errors
+            print(f"An unexpected error occurred assembling deck: {e}")
             self.db_session.rollback()
             return False
 

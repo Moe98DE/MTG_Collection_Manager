@@ -1,8 +1,10 @@
 import re
+from collections import Counter
 from typing import List, Dict
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func, case
 
+from .exceptions import InvalidInputFormatError, InstanceAlreadyAllocatedError, CardNotFoundError, DeckAssemblyError
 from .scryfall_client import ScryfallClient
 from .models import CardPrinting, OracleCard, Deck, DeckStatus, BlueprintEntry, CardInstance, CardPrinting # Add new imports
 
@@ -10,6 +12,8 @@ class CollectionRepository:
     def __init__(self, db_session: Session, scryfall_client: ScryfallClient):
         self.session = db_session
         self.scryfall_client = scryfall_client
+        # A list of fields that are safe for a user to update on a CardInstance
+        self.updatable_instance_fields = ['is_foil', 'condition', 'purchase_price', 'deck_id']
         print("Collection Repository initialized.")
 
     def _parse_card_string(self, line: str) -> dict | None:
@@ -24,8 +28,7 @@ class CollectionRepository:
         match = pattern.match(line.strip())
 
         if not match:
-            print(f"Error: Could not parse line '{line}'")
-            return None
+            raise InvalidInputFormatError(line=line)
 
         quantity, name, set_code, collector_number = match.groups()
 
@@ -39,29 +42,41 @@ class CollectionRepository:
 
     def add_card_from_string(self, line: str) -> List[CardInstance]:
         """
-        High-level method to process a string, fetch card data,
+        High-level method to process a string, fetch card data, verify it,
         and create CardInstance objects in the database.
         """
         parsed_data = self._parse_card_string(line)
-        if not parsed_data:
-            return []
 
-        # Use the Scryfall client to get the CardPrinting object
+        # This will raise an exception if parsing fails.
+        user_provided_name = parsed_data['name']
+
         printing = self.scryfall_client.get_printing_by_set_and_number(
             set_code=parsed_data['set_code'],
             collector_number=parsed_data['collector_number']
         )
 
-        if not printing:
-            print(f"Error: Could not find card printing for '{parsed_data['name']}'")
-            return []
+        # Scryfall client raises CardNotFoundError if the set/number combo is invalid
+        # But we still need to check if the card found is the one the user asked for.
 
-        # Create the specified number of CardInstance objects
+        # --- THE CRITICAL FIX ---
+        # Compare the name parsed from the user's string with the name from Scryfall.
+        # We use `.lower()` and check if the user's name is a substring to allow for
+        # partial names like "Sol Ring" for "Sol Ring // Sol Talisman".
+        scryfall_card_name = printing.oracle_card.name.lower()
+        if user_provided_name.lower() not in scryfall_card_name:
+            raise CardNotFoundError(
+                identifier=f"'{user_provided_name}' does not match the card found at "
+                           f"{parsed_data['set_code'].upper()} #{parsed_data['collector_number']}: "
+                           f"'{printing.oracle_card.name}'"
+            )
+        # --- END OF FIX ---
+
         new_instances = []
         for _ in range(parsed_data['quantity']):
             instance = CardInstance(
                 printing_id=printing.id,
                 is_foil=parsed_data['is_foil']
+                # date_added is handled by the DB default
             )
             self.session.add(instance)
             new_instances.append(instance)
@@ -69,55 +84,125 @@ class CollectionRepository:
         self.session.commit()
         print(f"Successfully added {parsed_data['quantity']}x '{printing.oracle_card.name}' to collection.")
         return new_instances
-        
+
+    def add_cards_from_list_transactional(self, card_lines: List[str]) -> Dict[str, any]:
+        """
+        Processes a list of card strings, preparing them for a single transaction.
+        This method does NOT commit the session.
+
+        Returns a dictionary containing a list of successfully created CardInstance objects
+        and a list of lines that failed to process.
+        """
+        successful_instances = []
+        failed_lines = []
+
+        for line in card_lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                # We can reuse the single-add logic, but we must catch its exceptions locally
+                # instead of letting them halt the entire process.
+                parsed_data = self._parse_card_string(line)
+                user_provided_name = parsed_data['name']
+
+                printing = self.scryfall_client.get_printing_by_set_and_number(
+                    set_code=parsed_data['set_code'],
+                    collector_number=parsed_data['collector_number']
+                )
+
+                scryfall_card_name = printing.oracle_card.name.lower()
+                if user_provided_name.lower() not in scryfall_card_name:
+                    raise CardNotFoundError(
+                        identifier=f"'{user_provided_name}' does not match the card found: '{printing.oracle_card.name}'"
+                    )
+
+                for _ in range(parsed_data['quantity']):
+                    instance = CardInstance(
+                        printing_id=printing.id,
+                        is_foil=parsed_data['is_foil']
+                    )
+                    self.session.add(instance)
+                    successful_instances.append(instance)
+
+                print(f"Prepared {parsed_data['quantity']}x '{printing.oracle_card.name}' for addition.")
+
+            except (InvalidInputFormatError, CardNotFoundError) as e:
+                print(f"Skipping line due to error: '{line}' -> {e.message}")
+                failed_lines.append(line)
+            # Note: We do NOT catch generic Exception, as that might hide a real database problem.
+
+        return {"successes": successful_instances, "failures": failed_lines}
+
     def view_collection_summary(self, filters: dict = None) -> list:
         """
-        Queries the collection and returns a summary, grouped by OracleCard name.
+        Queries the collection and returns a summary, grouped by OracleCard.
         Dynamically applies a dictionary of complex filters.
+        Returns a list of tuples:
+        (OracleCard object, total_owned, available_count, representative_image_uri)
         """
         if filters is None: filters = {}
 
         query = (
             self.session.query(
-                OracleCard.name, 
-                func.count(CardInstance.id).label("total_owned")
+                OracleCard,
+                func.count(CardInstance.id).label("total_owned"),
+                func.sum(case((CardInstance.deck_id == None, 1), else_=0)).label("available_count"),
+                # UPDATED: Add an aggregate to get one representative image URI for the group.
+                # MIN() is a simple and effective way to deterministically pick one image.
+                func.min(CardPrinting.image_uri_normal).label("image_uri")
             )
             .join(CardPrinting, OracleCard.id == CardPrinting.oracle_card_id)
             .join(CardInstance, CardPrinting.id == CardInstance.printing_id)
         )
 
         # --- Dynamic Filter Application ---
+        # (All the filter logic remains exactly the same as before)
         if filters.get('name'):
             query = query.filter(OracleCard.name.ilike(f"%{filters['name']}%"))
-        
-        if filters.get('type'):
-            query = query.filter(OracleCard.type_line.ilike(f"%{filters['type']}%"))
-        
+
+        if filters.get('type_line'):
+            query = query.filter(OracleCard.type_line.ilike(f"%{filters['type_line']}%"))
+
+        if filters.get('oracle_text'):
+            query = query.filter(OracleCard.oracle_text.ilike(f"%{filters['oracle_text']}%"))
+
+        cmc_filter = filters.get('cmc')
+        if isinstance(cmc_filter, dict) and 'op' in cmc_filter and 'value' in cmc_filter:
+            op = cmc_filter['op']
+            val = cmc_filter['value']
+            if op == '<=':
+                query = query.filter(OracleCard.cmc <= val)
+            elif op == '>=':
+                query = query.filter(OracleCard.cmc >= val)
+            elif op == '=':
+                query = query.filter(OracleCard.cmc == val)
+
         selected_colors = filters.get('colors', [])
         if selected_colors:
-            # This logic ensures the card's color identity is a SUBSET of the selected colors.
-            # For each color in the card's identity, it must be one of the selected colors.
-            # A card with identity 'W' will match if 'W' or 'WU' is selected.
-            # A card with identity 'WU' will only match if BOTH 'W' and 'U' are selected.
             for color in ['W', 'U', 'B', 'R', 'G']:
-                if color in selected_colors:
-                    # If user selected this color, we don't care if the card has it or not.
-                    continue
-                else:
-                    # If user did NOT select this color, the card must NOT have it.
+                if color not in selected_colors:
                     query = query.filter(OracleCard.color_identity.notlike(f"%{color}%"))
-            
-            if 'C' in selected_colors:
-                # If colorless is explicitly selected, allow cards with empty color identity
-                pass # This is implicitly handled by the logic above
-        
-        if filters.get('available'):
-            # This is the core logic: only include instances that are NOT assigned to a deck.
+
+        if filters.get('set_code'):
+            subquery = (
+                self.session.query(CardInstance.id)
+                .join(CardPrinting)
+                .filter(CardPrinting.set_code.ilike(filters['set_code']))
+                .subquery()
+            )
+            query = query.filter(CardInstance.id.in_(subquery))
+
+        availability = filters.get('availability')
+        if availability == 'Only Available':
             query = query.filter(CardInstance.deck_id == None)
+        elif availability == 'Only Allocated':
+            query = query.filter(CardInstance.deck_id != None)
 
         summary = (
             query
-            .group_by(OracleCard.name)
+            .group_by(OracleCard.id)
             .order_by(OracleCard.name)
             .all()
         )
@@ -163,17 +248,50 @@ class CollectionRepository:
         if instance:
             # Important check: Do not delete if it's part of an assembled deck.
             if instance.deck_id is not None:
-                print(f"Error: Cannot delete card instance {instance_id} because it is in an assembled deck.")
-                return False
+                raise InstanceAlreadyAllocatedError(
+                    instance_id=instance.id,
+                    deck_name=instance.deck.name
+                )
             
             self.session.delete(instance)
             self.session.commit()
             print(f"Successfully deleted card instance {instance_id}.")
             return True
         
-        print(f"Error: Could not find card instance with ID {instance_id} to delete.")
-        return False
-    
+        raise CardNotFoundError(identifier=f"Instance ID {instance_id}")
+
+    def update_card_instance(self, instance_id: int, update_data: dict) -> CardInstance:
+        """
+        Updates attributes of a specific CardInstance.
+
+        Args:
+            instance_id: The primary key of the CardInstance to update.
+            update_data: A dictionary where keys are field names and values are the new values.
+
+        Returns:
+            The updated CardInstance object.
+
+        Raises:
+            CardNotFoundError: If no instance with the given ID is found.
+            ValueError: If an invalid field is provided in update_data.
+        """
+        instance = self.session.get(CardInstance, instance_id)
+
+        if not instance:
+            raise CardNotFoundError(identifier=f"Instance ID {instance_id}")
+
+        for field, value in update_data.items():
+            if field in self.updatable_instance_fields:
+                setattr(instance, field, value)
+            else:
+                # Raise an error to prevent updating protected fields like 'id' or 'printing_id'
+                raise ValueError(f"'{field}' is not an updatable field on CardInstance.")
+
+        self.session.commit()
+        self.session.refresh(instance)  # Refresh the object with the latest data from the DB
+        print(f"Successfully updated card instance {instance_id}.")
+        return instance
+
 class DeckRepository:
     def __init__(self, db_session: Session, scryfall_client: ScryfallClient):
         self.session = db_session
@@ -251,29 +369,83 @@ class DeckRepository:
         
         self.session.commit()
 
-    def assemble_deck(self, deck_id: int, choices: dict) -> bool:
+        # NEW: A dedicated validation method.
+    def validate_assembly_choices(self, deck_id: int, chosen_instance_ids: List[int]) -> bool:
+        """
+        Validates if the user's chosen CardInstances are sufficient and valid for a blueprint.
+
+        Raises:
+            DeckAssemblyError: If validation fails for any reason.
+
+        Returns:
+            True if the choices are valid.
+        """
+        deck = self.session.query(Deck).options(
+            joinedload(Deck.blueprint_entries).joinedload(BlueprintEntry.oracle_card)
+        ).get(deck_id)
+
+        if not deck or deck.status != DeckStatus.BLUEPRINT:
+            raise DeckAssemblyError(f"Deck with ID {deck_id} is not a valid blueprint for assembly.")
+
+        # 1. Get the blueprint requirements (what we need)
+        blueprint_needs = {entry.oracle_card_id: entry.quantity for entry in deck.blueprint_entries}
+
+        # 2. Get the chosen physical cards (what we have)
+        chosen_instances = self.session.query(CardInstance).options(joinedload(CardInstance.printing)).filter(
+            CardInstance.id.in_(chosen_instance_ids)
+        ).all()
+
+        # 3. Check for invalid or already-allocated instances
+        if len(chosen_instances) != len(chosen_instance_ids):
+            raise DeckAssemblyError("One or more selected card instance IDs are invalid.")
+
+        for inst in chosen_instances:
+            if inst.deck_id is not None:
+                raise DeckAssemblyError(
+                    f"Card '{inst.printing.oracle_card.name}' (ID: {inst.id}) is already in another deck.")
+
+        # 4. Count the Oracle IDs of the chosen cards and compare with the blueprint
+        chosen_oracle_ids = [inst.printing.oracle_card_id for inst in chosen_instances]
+        chosen_counts = Counter(chosen_oracle_ids)
+
+        for oracle_id, needed_qty in blueprint_needs.items():
+            if chosen_counts.get(oracle_id, 0) < needed_qty:
+                # Find card name for a better error message
+                card_name = self.session.get(OracleCard, oracle_id).name
+                raise DeckAssemblyError(
+                    f"Not enough cards chosen for '{card_name}'. Need {needed_qty}, but only got {chosen_counts.get(oracle_id, 0)}.")
+
+        if sum(chosen_counts.values()) != sum(blueprint_needs.values()):
+            raise DeckAssemblyError(
+                "The total number of chosen cards does not match the total number of cards in the blueprint.")
+
+        return True
+
+    def assemble_deck(self, deck_id: int, chosen_instance_ids: List[int]):
         """
         Transitions a deck from Blueprint to Assembled.
-        - Assigns chosen CardInstances to the deck.
-        - Deletes the old blueprint entries.
+        This method does NOT commit. The calling service is responsible for transaction management.
         """
-        deck = self.session.get(Deck, deck_id)
-        if not deck or deck.status != DeckStatus.BLUEPRINT:
-            return False
+        # The 'with begin_nested()' ensures this block is atomic (creates a SAVEPOINT).
+        # If anything inside fails, only these changes are rolled back.
+        with self.session.begin_nested():
+            deck = self.session.get(Deck, deck_id)
+            if not deck or deck.status != DeckStatus.BLUEPRINT:
+                # Raise an error instead of returning False to ensure transaction rollback
+                raise DeckAssemblyError(f"Deck {deck_id} is not a valid blueprint.")
 
-        # Assign instances
-        for instance_id in choices.values():
-            instance = self.session.get(CardInstance, instance_id)
-            if instance:
-                instance.deck_id = deck_id
+            # Assign instances...
+            self.session.query(CardInstance).filter(
+                CardInstance.id.in_(chosen_instance_ids)
+            ).update({"deck_id": deck_id}, synchronize_session=False)
 
-        # Delete old blueprint entries
-        self.session.query(BlueprintEntry).filter_by(deck_id=deck_id).delete()
-        
-        # Update deck status
-        deck.status = DeckStatus.ASSEMBLED
-        self.session.commit()
-        return True
+            # Delete blueprint...
+            self.session.query(BlueprintEntry).filter_by(deck_id=deck_id).delete(synchronize_session=False)
+
+            # Update status...
+            deck.status = DeckStatus.ASSEMBLED
+
+        print(f"Deck '{deck.name}' successfully prepared for assembly commit.")
 
     def disassemble_deck(self, deck_id: int) -> bool:
         """
