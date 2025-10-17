@@ -45,6 +45,7 @@ class OracleCard(Base):
     oracle_id = Column(String, unique=True, index=True) # Scryfall's unique ID for this card concept
     name = Column(String, index=True)
     color_identity = Column(String) # e.g., "WUBRG"
+    type_line = Column(String, nullable=True)
     
     # This card concept has many different printings
     printings = relationship("CardPrinting", back_populates="oracle_card")
