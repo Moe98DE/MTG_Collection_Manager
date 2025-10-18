@@ -10,6 +10,7 @@ from .models import CardPrinting, CardInstance, Deck, DeckStatus # Add missing i
 from core.api.scryfall_client import ScryfallClient
 from core.repo.collection_repository import CollectionRepository
 from core.repo.deck_repository import DeckRepository
+from .repo.dtos import BlueprintAnalysisItem
 
 
 # NEW: A fully fleshed-out Data Transfer Object for collection summary views
@@ -235,46 +236,23 @@ class MagicCardService:
             self.db_session.rollback()
             return False
         
-    def get_deck_blueprint_analysis(self, deck_id: int) -> list:
+    def get_deck_blueprint_analysis(self, deck_id: int) -> List[BlueprintAnalysisItem]:
         """
-        Analyzes a blueprint deck against the user's collection.
-        Returns a UI-friendly list of cards with their status.
+        Analyzes a blueprint deck against the user's collection by delegating
+        to the deck repository.
+
+        Returns a list of structured BlueprintAnalysisItem objects, ready for the UI.
         """
-        deck = self.deck_repo.session.get(Deck, deck_id)
-        if not deck or deck.status != DeckStatus.BLUEPRINT:
+        try:
+            return self.deck_repo.analyze_blueprint_against_collection(deck_id)
+        except ValueError as e:
+            # Handle the case where the repo raises an error for an invalid deck
+            print(f"SERVICE LAYER ERROR: {e}")
             return []
-
-        # Get available and total owned cards (efficiently)
-        available_cards = self.db_session.query(CardPrinting.oracle_card_id, func.count(CardInstance.id)).join(CardInstance).filter(CardInstance.deck_id == None).group_by(CardPrinting.oracle_card_id).all()
-        available_map = dict(available_cards)
-        total_owned_cards = self.db_session.query(CardPrinting.oracle_card_id, func.count(CardInstance.id)).join(CardInstance).group_by(CardPrinting.oracle_card_id).all()
-        total_owned_map = dict(total_owned_cards)
-
-        analysis = []
-        for entry in deck.blueprint_entries:
-            needed = entry.quantity
-            available = available_map.get(entry.oracle_card_id, 0)
-            total_owned = total_owned_map.get(entry.oracle_card_id, 0)
-
-            status = "MISSING"
-            if available >= needed:
-                status = "AVAILABLE"
-            elif total_owned >= needed:
-                status = "ALLOCATED"
-            elif total_owned > 0:
-                status = "PARTIAL"
-
-            analysis.append({
-                "oracle_card_id": entry.oracle_card_id,
-                "card_name": entry.oracle_card.name,
-                "quantity": needed,
-                "status": status,
-                "owned": total_owned,
-            })
-        
-        # Sort by card name
-        analysis.sort(key=lambda x: x['card_name'])
-        return analysis
+        except Exception as e:
+            # Catch any other unexpected errors
+            print(f"An unexpected error occurred during deck analysis: {e}")
+            return []
     
     def remove_card_from_blueprint(self, deck_id: int, oracle_card_id: int) -> bool:
         """Removes a card entry completely from a blueprint."""

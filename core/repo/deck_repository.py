@@ -4,8 +4,10 @@ from typing import List, Dict
 from sqlalchemy.orm import Session, joinedload
 
 from core.exceptions import DeckAssemblyError, CardNotFoundError
-from core.models import Deck, DeckStatus, BlueprintEntry, OracleCard, CardInstance
+from core.models import Deck, DeckStatus, BlueprintEntry, OracleCard, CardInstance, CardPrinting
 from core.api.scryfall_client import ScryfallClient
+from core.repo.dtos import BlueprintAnalysisItem
+from core.repo.enums import BlueprintCardStatus
 
 
 class DeckRepository:
@@ -267,3 +269,93 @@ class DeckRepository:
             print(f"Deleted deck: '{deck.name}'")
             return True
         return False
+
+    def analyze_blueprint_against_collection(self, deck_id: int) -> List[BlueprintAnalysisItem]:
+        """
+        Performs a comprehensive analysis of a blueprint deck against the user's collection.
+        This is the core logic for the "buy list" and "deck check" features.
+
+        Args:
+            deck_id: The ID of the blueprint deck to analyze.
+
+        Returns:
+            A list of BlueprintAnalysisItem DTOs detailing the status of each card.
+        """
+        deck = self.session.get(Deck, deck_id)
+        if not deck or deck.status != DeckStatus.BLUEPRINT:
+            # It's better to raise an exception for an invalid deck ID or status
+            # than to return an empty list, as it's an exceptional circumstance.
+            raise ValueError(f"Deck with ID {deck_id} is not a valid blueprint.")
+
+        # --- Step 1: Get all card requirements from the blueprint ---
+        blueprint_requirements = {
+            entry.oracle_card_id: {
+                "name": entry.oracle_card.name,
+                "needed": entry.quantity
+            }
+            for entry in deck.blueprint_entries
+        }
+        all_required_oracle_ids = list(blueprint_requirements.keys())
+
+        if not all_required_oracle_ids:
+            return []  # Deck is empty, nothing to analyze
+
+        # --- Step 2: Get all owned instances of the required cards in ONE query ---
+        # This is more efficient than separate queries for 'total' and 'available'.
+        owned_instances = (
+            self.session.query(
+                CardPrinting.oracle_card_id,
+                CardInstance.deck_id,
+                Deck.name.label("deck_name")  # Get the deck name if it exists
+            )
+            .join(CardInstance, CardPrinting.id == CardInstance.printing_id)
+            .outerjoin(Deck, CardInstance.deck_id == Deck.id)
+            .filter(CardPrinting.oracle_card_id.in_(all_required_oracle_ids))
+            .all()
+        )
+
+        # --- Step 3: Process the query results into a useful structure in memory ---
+        # { oracle_id: {"total": 5, "available": 2, "allocations": ["Deck A", "Deck B"]} }
+        collection_state = {
+            oracle_id: {"total": 0, "available": 0, "allocations": []}
+            for oracle_id in all_required_oracle_ids
+        }
+
+        for oracle_id, deck_id, deck_name in owned_instances:
+            collection_state[oracle_id]["total"] += 1
+            if deck_id is None:
+                collection_state[oracle_id]["available"] += 1
+            else:
+                # Add deck name to the list if it's not already there
+                if deck_name not in collection_state[oracle_id]["allocations"]:
+                    collection_state[oracle_id]["allocations"].append(deck_name)
+
+        # --- Step 4: Combine blueprint needs with collection state to generate the final analysis ---
+        analysis_results = []
+        for oracle_id, needs in blueprint_requirements.items():
+            state = collection_state.get(oracle_id, {"total": 0, "available": 0, "allocations": []})
+            needed_qty = needs['needed']
+            total_owned = state['total']
+            available_owned = state['available']
+
+            status = BlueprintCardStatus.MISSING  # Default status
+            if available_owned >= needed_qty:
+                status = BlueprintCardStatus.OWNED_AVAILABLE
+            elif total_owned >= needed_qty:
+                status = BlueprintCardStatus.OWNED_ALLOCATED
+            elif total_owned > 0:
+                status = BlueprintCardStatus.PARTIALLY_OWNED
+
+            analysis_results.append(BlueprintAnalysisItem(
+                oracle_card_id=oracle_id,
+                card_name=needs['name'],
+                quantity_needed=needed_qty,
+                total_owned=total_owned,
+                available_owned=available_owned,
+                status=status,
+                allocated_in_decks=state['allocations']
+            ))
+
+        # Sort alphabetically by card name for a consistent UI presentation
+        analysis_results.sort(key=lambda x: x.card_name)
+        return analysis_results
