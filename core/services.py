@@ -84,30 +84,29 @@ class MagicCardService:
         Adds one or more card instances to the collection from a string.
         Returns True on success, False on failure.
         """
-        # UPDATED: Catch specific exceptions and provide context
         try:
             instances = self.collection_repo.add_card_from_string(card_string)
-            return len(instances) > 0
-        except InvalidInputFormatError as e:
-            print(f"SERVICE LAYER ERROR: {e.message}")
-            self.db_session.rollback()
-            return False
-        except CardNotFoundError as e:
+            if instances:
+                self.db_session.commit()  # COMMIT ON SUCCESS
+                return True
+            return False  # This case might not be reachable if repo raises exception, but it's safe
+        except (InvalidInputFormatError, CardNotFoundError) as e:
             print(f"SERVICE LAYER ERROR: {e.message}")
             self.db_session.rollback()
             return False
         except Exception as e:
-            # A general catch-all for unexpected errors
             print(f"An unexpected error occurred in add_card_to_collection: {e}")
             self.db_session.rollback()
             return False
 
     def delete_card_instance(self, instance_id: int) -> bool:
         """Service layer wrapper for deleting a card instance."""
-        # UPDATED: Catch our new exceptions
         try:
-            return self.collection_repo.delete_card_instance(instance_id)
-        except CoreLogicError as e:  # Catches our custom base exception and its children
+            deleted = self.collection_repo.delete_card_instance(instance_id)
+            if deleted:
+                self.db_session.commit()  # COMMIT ON SUCCESS
+            return deleted
+        except CoreLogicError as e:
             print(f"SERVICE LAYER ERROR: {e.message}")
             self.db_session.rollback()
             return False
@@ -122,12 +121,12 @@ class MagicCardService:
         Returns the updated CardInstance on success, None on failure.
         """
         try:
-            # Basic validation: ensure update_data is a non-empty dictionary
             if not isinstance(update_data, dict) or not update_data:
-                print("SERVICE LAYER ERROR: update_data must be a non-empty dictionary.")
-                return None
+                raise ValueError("update_data must be a non-empty dictionary.")
 
-            return self.collection_repo.update_card_instance(instance_id, update_data)
+            updated_instance = self.collection_repo.update_card_instance(instance_id, update_data)
+            self.db_session.commit()  # COMMIT ON SUCCESS
+            return updated_instance
         except (CoreLogicError, ValueError) as e:
             print(f"SERVICE LAYER ERROR: {e}")
             self.db_session.rollback()
@@ -217,20 +216,25 @@ class MagicCardService:
         
     def create_deck(self, name: str) -> bool:
         """Creates a new deck."""
-        if not name or len(name.strip()) == 0:
-            return False
+        if not name or not name.strip():
+            print("SERVICE LAYER ERROR: Deck name cannot be empty.")
+            return None
         try:
-            self.deck_repo.create_deck(name)
-            return True
+            new_deck = self.deck_repo.create_deck(name.strip())
+            self.db_session.commit()  # COMMIT ON SUCCESS
+            return new_deck
         except Exception as e:
             print(f"Error creating deck: {e}")
             self.db_session.rollback()
-            return False
+            return None
 
     def delete_deck(self, deck_id: int) -> bool:
         """Deletes a deck by its ID."""
         try:
-            return self.deck_repo.delete_deck(deck_id)
+            deleted = self.deck_repo.delete_deck(deck_id)
+            if deleted:
+                self.db_session.commit()  # COMMIT ON SUCCESS
+            return deleted
         except Exception as e:
             print(f"Error deleting deck: {e}")
             self.db_session.rollback()
@@ -257,7 +261,9 @@ class MagicCardService:
     def remove_card_from_blueprint(self, deck_id: int, oracle_card_id: int) -> bool:
         """Removes a card entry completely from a blueprint."""
         try:
+            # Note: the repo method returns nothing, it just modifies the session
             self.deck_repo.update_blueprint_entry_quantity(deck_id, oracle_card_id, 0)
+            self.db_session.commit()  # COMMIT ON SUCCESS
             return True
         except Exception as e:
             print(f"Error removing card from blueprint: {e}")
@@ -366,11 +372,14 @@ class MagicCardService:
     def disassemble_deck(self, deck_id: int) -> bool:
         """Service layer wrapper for disassembling a deck."""
         try:
-            return self.deck_repo.disassemble_deck(deck_id)
+            success = self.deck_repo.disassemble_deck(deck_id)
+            if success:
+                self.db_session.commit()  # COMMIT ON SUCCESS
+            return success
         except Exception as e:
             print(f"Error disassembling deck: {e}")
             self.db_session.rollback()
-            return False        
+            return False
         
     def get_assembled_deck_contents(self, deck_id: int) -> List[Dict[str, any]]:
         """Returns a UI-friendly list of cards in an assembled deck."""

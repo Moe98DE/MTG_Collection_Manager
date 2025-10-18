@@ -80,7 +80,6 @@ class CollectionRepository:
             self.session.add(instance)
             new_instances.append(instance)
 
-        self.session.commit()
         print(f"Successfully added {parsed_data['quantity']}x '{printing.oracle_card.name}' to collection.")
         return new_instances
 
@@ -253,7 +252,6 @@ class CollectionRepository:
                 )
             
             self.session.delete(instance)
-            self.session.commit()
             print(f"Successfully deleted card instance {instance_id}.")
             return True
         
@@ -286,7 +284,6 @@ class CollectionRepository:
                 # Raise an error to prevent updating protected fields like 'id' or 'printing_id'
                 raise ValueError(f"'{field}' is not an updatable field on CardInstance.")
 
-        self.session.commit()
         self.session.refresh(instance)  # Refresh the object with the latest data from the DB
         print(f"Successfully updated card instance {instance_id}.")
         return instance

@@ -20,7 +20,6 @@ class DeckRepository:
         """Creates a new, empty deck in the Blueprint state."""
         new_deck = Deck(name=name, status=DeckStatus.BLUEPRINT)
         self.session.add(new_deck)
-        self.session.commit()
         print(f"Created new blueprint deck: '{name}'")
         return new_deck
 
@@ -64,7 +63,6 @@ class DeckRepository:
             self.session.add(new_entry)
             print(f"Added {quantity}x '{card_name}' to '{deck.name}' blueprint.")
 
-        self.session.commit()
         return existing_entry or new_entry # Return the entry that was created/updated
 
     def add_cards_to_blueprint_transactional(self, deck_id: int, card_lines: List[str]) -> Dict[str, List[str]]:
@@ -150,7 +148,6 @@ class DeckRepository:
             entry.quantity = new_quantity
             print(f"Updated '{entry.oracle_card.name}' quantity to {new_quantity}.")
 
-        self.session.commit()
 
     # NEW: A dedicated validation method.
     def validate_assembly_choices(self, deck_id: int, chosen_instance_ids: List[int]) -> bool:
@@ -252,7 +249,6 @@ class DeckRepository:
             self.session.add(new_entry)
 
         deck.status = DeckStatus.BLUEPRINT
-        self.session.commit()
         return True
 
     def get_all_decks(self) -> list[Deck]:
@@ -265,7 +261,6 @@ class DeckRepository:
         if deck:
             # The 'cascade' option we set on the model will handle deleting blueprint entries.
             self.session.delete(deck)
-            self.session.commit()
             print(f"Deleted deck: '{deck.name}'")
             return True
         return False

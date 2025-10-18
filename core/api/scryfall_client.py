@@ -138,9 +138,6 @@ class ScryfallClient:
                 )
                 self.session.add(printing)
 
-        # The main session commit will be handled by the calling function in the repository
-        # or we can commit here if this client is used independently. Let's commit for safety.
-        self.session.commit()
-
+        # The service layer is now responsible for the commit.
         # After commit, the 'printing' object is fully attached to the session and its relationships are loaded
         return printing
