@@ -16,3 +16,8 @@ class BlueprintCardStatus(enum.Enum):
     def __str__(self):
         # This makes it easy to print the enum or use it in f-strings
         return self.value
+
+
+class DeckStatus(enum.Enum):
+    BLUEPRINT = "blueprint"
+    ASSEMBLED = "assembled"

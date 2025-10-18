@@ -6,66 +6,14 @@ from sqlalchemy import func
 
 from .exceptions import InvalidInputFormatError, CardNotFoundError, CoreLogicError, DeckAssemblyError
 from .models import SessionLocal
-from .models import CardPrinting, CardInstance, Deck, DeckStatus # Add missing imports
+from .models import CardPrinting, CardInstance, Deck  # Add missing imports
+from .repo.enums import DeckStatus, BlueprintCardStatus
 from core.api.scryfall_client import ScryfallClient
 from core.repo.collection_repository import CollectionRepository
 from core.repo.deck_repository import DeckRepository
-from .repo.dtos import BlueprintAnalysisItem
+from .repo.dtos import BlueprintAnalysisItem, AssemblyChoiceDTO, AssemblyOptionDTO, AssembledDeckCardDTO, \
+    DeckSummaryDTO, CardInstanceDetailDTO, CollectionSummaryItem
 
-
-# NEW: A fully fleshed-out Data Transfer Object for collection summary views
-@dataclass
-class CollectionSummaryItem:
-    """
-    Represents a single, grouped entry in the user's collection view.
-    This is a Data Transfer Object (DTO) designed to provide all necessary
-    information for a rich UI display in a single object.
-    """
-    # Core identifying information
-    oracle_id: str
-    name: str
-
-    # Key gameplay attributes for sorting and display
-    type_line: str
-    mana_cost: Optional[str]
-    cmc: float
-    color_identity: str
-
-    # User's collection statistics
-    total_owned: int
-    available_count: int
-
-    # Display and aesthetic information
-    # We'll pick the image from the first printing we find for this card.
-    # It provides a good visual representation without complex logic.
-    representative_image_uri: Optional[str]
-
-    # Making keywords a list is much nicer for a frontend to consume than a raw string.
-    keywords: List[str] = field(default_factory=list)
-
-    @staticmethod
-    def from_repository_tuple(repo_tuple) -> 'CollectionSummaryItem':
-        """
-        A factory method to create an instance from the data structure
-        returned by the CollectionRepository.
-        """
-        oracle_card, total, available, image_uri = repo_tuple
-
-        # Split the comma-separated string from the DB back into a list
-        keywords_list = [k.strip() for k in oracle_card.keywords.split(',') if k.strip()]
-
-        return CollectionSummaryItem(
-            oracle_id=oracle_card.id,
-            name=oracle_card.name,
-            type_line=oracle_card.type_line,
-            mana_cost=oracle_card.mana_cost,
-            cmc=oracle_card.cmc,
-            color_identity=oracle_card.color_identity,
-            total_owned=total,
-            available_count=available,
-            representative_image_uri=image_uri,
-            keywords=keywords_list
-        )
 
 class MagicCardService:
     def __init__(self):
@@ -115,7 +63,7 @@ class MagicCardService:
             self.db_session.rollback()
             return False
 
-    def update_card_instance(self, instance_id: int, update_data: dict) -> CardInstance | None:
+    def update_card_instance(self, instance_id: int, update_data: dict) -> CardInstanceDetailDTO | None:
         """
         Service layer wrapper for updating a card instance.
         Returns the updated CardInstance on success, None on failure.
@@ -124,9 +72,26 @@ class MagicCardService:
             if not isinstance(update_data, dict) or not update_data:
                 raise ValueError("update_data must be a non-empty dictionary.")
 
-            updated_instance = self.collection_repo.update_card_instance(instance_id, update_data)
-            self.db_session.commit()  # COMMIT ON SUCCESS
-            return updated_instance
+            instance = self.collection_repo.update_card_instance(instance_id, update_data)
+            self.db_session.commit()
+
+            # --- DTO Translation Logic ---
+            status = "✅ Available"
+            if instance.deck:
+                status = f"⚠️ In '{instance.deck.name}'"
+
+            return CardInstanceDetailDTO(
+                instance_id=instance.id,
+                oracle_id=instance.printing.oracle_card.id,
+                card_name=instance.printing.oracle_card.name,
+                set_code=instance.printing.set_code.upper(),
+                collector_number=instance.printing.collector_number,
+                is_foil=instance.is_foil,
+                condition=instance.condition,
+                purchase_price=instance.purchase_price,
+                date_added=instance.date_added.isoformat(),
+                status=status
+            )
         except (CoreLogicError, ValueError) as e:
             print(f"SERVICE LAYER ERROR: {e}")
             self.db_session.rollback()
@@ -139,40 +104,65 @@ class MagicCardService:
     def get_collection_summary(self, filters: dict = None) -> List[CollectionSummaryItem]:
         """
         Retrieves the collection summary, applying any specified filters.
-        Returns a list of structured CollectionSummaryItem objects.
+        Translates the repository's output into a list of DTOs.
         """
-        # The repository now returns tuples in the format our DTO expects.
+        # The repository still returns tuples: (OracleCard, total, available, image_uri)
         summary_tuples = self.collection_repo.view_collection_summary(filters=filters)
 
-        # UPDATED: Use the clean factory method for conversion.
-        return [CollectionSummaryItem.from_repository_tuple(t) for t in summary_tuples]
+        results = []
+        for repo_tuple in summary_tuples:
+            # --- The translation logic now lives here, in the service layer ---
+            oracle_card, total, available, image_uri = repo_tuple
+
+            keywords_list = [k.strip() for k in oracle_card.keywords.split(',') if k.strip()]
+
+            item = CollectionSummaryItem(
+                oracle_id=oracle_card.id,
+                name=oracle_card.name,
+                type_line=oracle_card.type_line,
+                mana_cost=oracle_card.mana_cost,
+                cmc=oracle_card.cmc,
+                color_identity=oracle_card.color_identity,
+                total_owned=total,
+                available_count=available,
+                representative_image_uri=image_uri,
+                keywords=keywords_list
+            )
+            results.append(item)
+            # --- End of translation logic ---
+
+        return results
 
     def close_session(self):
         """Closes the database session. Should be called on application exit."""
         self.db_session.close()
 
-    def get_instances_for_oracle_card(self, name: str) -> List[Dict[str, any]]:
+    def get_instances_for_oracle_card(self, name: str) -> List[CardInstanceDetailDTO]:
         """
-        Gets detailed information for every physical instance of a card.
-        This is for the 'Drill-Down' view.
+        Gets detailed information for every physical instance of a card,
+        returning a list of DTOs.
         """
         instances_data = []
-        # Get raw data from the repository
         results = self.collection_repo.get_instances_by_oracle_name(name)
 
         for instance, printing, oracle, deck in results:
             status = "✅ Available"
             if deck:
                 status = f"⚠️ In '{deck.name}'"
-            
-            instances_data.append({
-                "instance_id": instance.id,
-                "set_code": printing.set_code.upper(),
-                "collector_number": printing.collector_number,
-                "is_foil": instance.is_foil,
-                "status": status,
-            })
-        
+
+            instances_data.append(CardInstanceDetailDTO(
+                instance_id=instance.id,
+                oracle_id=oracle.id,
+                card_name=oracle.name,
+                set_code=printing.set_code.upper(),
+                collector_number=printing.collector_number,
+                is_foil=instance.is_foil,
+                condition=instance.condition,
+                purchase_price=instance.purchase_price,
+                date_added=instance.date_added.isoformat(),
+                status=status
+            ))
+
         return instances_data
     
     def add_cards_from_list(self, card_list_string: str) -> dict:
@@ -205,12 +195,12 @@ class MagicCardService:
             print(f"A critical error occurred during bulk add. Rolling back transaction. Error: {e}")
             self.db_session.rollback()
             return {"success": 0, "failure": len(lines)}
-    
-    def get_all_decks(self) -> List[Dict[str, any]]:
-        """Returns a UI-friendly list of all decks."""
+
+    def get_all_decks(self) -> List[DeckSummaryDTO]:
+        """Returns a UI-friendly list of all decks as DTOs."""
         decks = self.deck_repo.get_all_decks()
         return [
-            {"id": deck.id, "name": deck.name, "status": deck.status.value}
+            DeckSummaryDTO(id=deck.id, name=deck.name, status=deck.status)
             for deck in decks
         ]
         
@@ -295,28 +285,35 @@ class MagicCardService:
         options = []
 
         for card in blueprint_analysis:
-            # Find all available physical instances for this oracle card
+            # We only need to find options for cards we actually own and can use.
+            if card.status not in [BlueprintCardStatus.OWNED_AVAILABLE, BlueprintCardStatus.OWNED_ALLOCATED]:
+                continue
+
             available_instances = (
                 self.db_session.query(CardInstance)
                 .join(CardPrinting)
-                .filter(CardPrinting.oracle_card_id == card['oracle_card_id'])
-                .filter(CardInstance.deck_id == None) # Must be available
+                .filter(CardPrinting.oracle_card_id == card.oracle_card_id)
+                .filter(CardInstance.deck_id == None)  # Must be available
                 .all()
             )
-            
+
             instance_choices = []
             for inst in available_instances:
-                instance_choices.append({
-                    "instance_id": inst.id,
-                    "text": f"{inst.printing.set_code.upper()} #{inst.printing.collector_number}{' (Foil)' if inst.is_foil else ''}"
-                })
+                foil_str = ' (Foil)' if inst.is_foil else ''
+                display = (f"{inst.printing.set_code.upper()} #{inst.printing.collector_number}{foil_str}"
+                           f" - {inst.condition}")
+                instance_choices.append(AssemblyChoiceDTO(
+                    instance_id=inst.id,
+                    display_text=display
+                ))
 
-            options.append({
-                "oracle_card_id": card['oracle_card_id'],
-                "card_name": card['card_name'],
-                "quantity_needed": card['quantity'],
-                "available_instances": instance_choices
-            })
+            options.append(AssemblyOptionDTO(
+                oracle_card_id=card.oracle_card_id,
+                card_name=card.card_name,
+                quantity_needed=card.quantity_needed,
+                available_instances=instance_choices
+            ))
+
         return options
 
     # UPDATED: The service method now orchestrates validation and assembly.
@@ -380,11 +377,11 @@ class MagicCardService:
             print(f"Error disassembling deck: {e}")
             self.db_session.rollback()
             return False
-        
-    def get_assembled_deck_contents(self, deck_id: int) -> List[Dict[str, any]]:
+
+    def get_assembled_deck_contents(self, deck_id: int) -> List[AssembledDeckCardDTO]:
         """Returns a UI-friendly list of cards in an assembled deck."""
         results = self.collection_repo.get_assembled_deck_contents(deck_id)
-        return [{"name": name, "quantity": qty} for name, qty in results]
+        return [AssembledDeckCardDTO(name=name, quantity=qty) for name, qty in results]
 
     def add_cards_to_blueprint_from_list(self, deck_id: int, card_list_string: str) -> dict:
         """

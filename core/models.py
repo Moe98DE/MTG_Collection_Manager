@@ -1,5 +1,4 @@
 import os
-import enum
 from sqlalchemy import (
     create_engine,
     Column,
@@ -16,6 +15,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, declarative_base, sessionmaker
 from sqlalchemy.sql import func  # NEW: To get the current time for defaults
 
+from core.repo.enums import DeckStatus
+
 # --- Database Setup ---
 
 # Define the base directory for the project
@@ -31,14 +32,6 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # The declarative base is a factory for creating mapped classes.
 Base = declarative_base()
-
-
-# --- Enums for Deck Status ---
-
-class DeckStatus(enum.Enum):
-    BLUEPRINT = "blueprint"
-    ASSEMBLED = "assembled"
-
 
 # --- Model Definitions ---
 

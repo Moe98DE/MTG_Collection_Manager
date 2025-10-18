@@ -4,10 +4,10 @@ from typing import List, Dict
 from sqlalchemy.orm import Session, joinedload
 
 from core.exceptions import DeckAssemblyError, CardNotFoundError
-from core.models import Deck, DeckStatus, BlueprintEntry, OracleCard, CardInstance, CardPrinting
+from core.models import Deck, BlueprintEntry, OracleCard, CardInstance, CardPrinting
 from core.api.scryfall_client import ScryfallClient
 from core.repo.dtos import BlueprintAnalysisItem
-from core.repo.enums import BlueprintCardStatus
+from core.repo.enums import BlueprintCardStatus, DeckStatus
 
 
 class DeckRepository:
