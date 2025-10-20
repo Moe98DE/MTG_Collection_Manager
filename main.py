@@ -1,28 +1,32 @@
-from core.models import Base, engine
+import sys
+import atexit
+from PySide6.QtWidgets import QApplication
+from frontend.main_window import MainWindow
 from core.services import MagicCardService
-from ui.main_window import App
 
-def create_database():
-    """Creates the database and all tables if they don't exist."""
-    Base.metadata.create_all(bind=engine)
-    print("Database is ready.")
+def main():
+    # --- Application Setup ---
+    app = QApplication(sys.argv)
+
+    # --- Service Layer Initialization ---
+    # Create a single service instance for the entire application lifetime
+    print("Initializing service layer...")
+    service_instance = MagicCardService()
+
+    # Register the service's session closer to be called on exit
+    atexit.register(service_instance.close_session)
+    print("Service layer initialized. Session will be closed on exit.")
+
+    # --- Main Window ---
+    window = MainWindow(service_instance)
+    window.show()
+
+    # --- Start Event Loop ---
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
-    create_database()
-
-    # 1. Initialize the service layer
-    service = MagicCardService()
-
-    # 2. Create the UI, injecting the service into it
-    app = App(service=service)
-
-    # 3. Set a function to be called when the window is closed
-    def on_closing():
-        print("Closing application, shutting down service.")
-        service.close_session()
-        app.destroy()
-
-    app.protocol("WM_DELETE_WINDOW", on_closing)
-
-    # 4. Run the application's main loop
-    app.mainloop()
+    # This is a common practice to ensure the `core` module can be found
+    # when running main.py directly from the `frontend` directory.
+    # A better solution is a proper package installation (e.g., using setup.py).
+    sys.path.append('..')
+    main()
