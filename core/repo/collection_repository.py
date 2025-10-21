@@ -1,11 +1,12 @@
 import re
 from typing import List, Dict
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, case
+from sqlalchemy import func, case, tuple_
 
 from core.exceptions import InvalidInputFormatError, InstanceAlreadyAllocatedError, CardNotFoundError
 from core.api.scryfall_client import ScryfallClient
-from core.models import OracleCard, Deck, CardInstance, CardPrinting # Add new imports
+from core.models import OracleCard, Deck, CardInstance, CardPrinting  # Add new imports
+
 
 class CollectionRepository:
     def __init__(self, db_session: Session, scryfall_client: ScryfallClient):
@@ -43,24 +44,34 @@ class CollectionRepository:
         """
         High-level method to process a string, fetch card data, verify it,
         and create CardInstance objects in the database.
+        Checks local cache before calling Scryfall API.
         """
         parsed_data = self._parse_card_string(line)
-
-        # This will raise an exception if parsing fails.
         user_provided_name = parsed_data['name']
 
-        printing = self.scryfall_client.get_printing_by_set_and_number(
+        # --- MODIFICATION ---
+        # First, try to find the printing in our local database to avoid an API call.
+        printing = self.session.query(CardPrinting).options(
+            joinedload(CardPrinting.oracle_card)  # Eager load for the name check later
+        ).filter_by(
             set_code=parsed_data['set_code'],
             collector_number=parsed_data['collector_number']
-        )
+        ).first()
+
+        if printing:
+            print(f"Found '{printing.oracle_card.name}' ({parsed_data['set_code'].upper()}) in local cache.")
+        else:
+            # If not found locally, then call the Scryfall client.
+            print(
+                f"Card {parsed_data['set_code'].upper()} #{parsed_data['collector_number']} not in cache, fetching from Scryfall...")
+            printing = self.scryfall_client.get_printing_by_set_and_number(
+                set_code=parsed_data['set_code'],
+                collector_number=parsed_data['collector_number']
+            )
+        # --- END MODIFICATION ---
 
         # Scryfall client raises CardNotFoundError if the set/number combo is invalid
         # But we still need to check if the card found is the one the user asked for.
-
-        # --- THE CRITICAL FIX ---
-        # Compare the name parsed from the user's string with the name from Scryfall.
-        # We use `.lower()` and check if the user's name is a substring to allow for
-        # partial names like "Sol Ring" for "Sol Ring // Sol Talisman".
         scryfall_card_name = printing.oracle_card.name.lower()
         if user_provided_name.lower() not in scryfall_card_name:
             raise CardNotFoundError(
@@ -68,7 +79,6 @@ class CollectionRepository:
                            f"{parsed_data['set_code'].upper()} #{parsed_data['collector_number']}: "
                            f"'{printing.oracle_card.name}'"
             )
-        # --- END OF FIX ---
 
         new_instances = []
         for _ in range(parsed_data['quantity']):
@@ -80,13 +90,14 @@ class CollectionRepository:
             self.session.add(instance)
             new_instances.append(instance)
 
-        print(f"Successfully added {parsed_data['quantity']}x '{printing.oracle_card.name}' to collection.")
+        print(f"Successfully prepared {parsed_data['quantity']}x '{printing.oracle_card.name}' for addition.")
         return new_instances
 
     def add_cards_from_list_transactional(self, card_lines: List[str]) -> Dict[str, any]:
         """
         Processes a list of card strings, preparing them for a single transaction.
-        This method does NOT commit the session.
+        This method does NOT commit the session. It has been optimized to check the local
+        cache for all cards first before making any API calls to Scryfall.
 
         Returns a dictionary containing a list of successfully created CardInstance objects
         and a list of lines that failed to process.
@@ -94,44 +105,118 @@ class CollectionRepository:
         successful_instances = []
         failed_lines = []
 
+        # 1. Parse all lines and identify the unique printings we need to find.
+        parsed_data_map = {}  # Maps original line -> parsed data dict
+        unique_printings_to_find = set()
+
         for line in card_lines:
             line = line.strip()
             if not line:
                 continue
-
             try:
-                # We can reuse the single-add logic, but we must catch its exceptions locally
-                # instead of letting them halt the entire process.
-                parsed_data = self._parse_card_string(line)
-                user_provided_name = parsed_data['name']
-
-                printing = self.scryfall_client.get_printing_by_set_and_number(
-                    set_code=parsed_data['set_code'],
-                    collector_number=parsed_data['collector_number']
+                parsed = self._parse_card_string(line)
+                parsed_data_map[line] = parsed
+                # Store a tuple of (set_code, collector_number) for lookup
+                unique_printings_to_find.add(
+                    (parsed['set_code'], parsed['collector_number'])
                 )
-
-                scryfall_card_name = printing.oracle_card.name.lower()
-                if user_provided_name.lower() not in scryfall_card_name:
-                    raise CardNotFoundError(
-                        identifier=f"'{user_provided_name}' does not match the card found: '{printing.oracle_card.name}'"
-                    )
-
-                for _ in range(parsed_data['quantity']):
-                    instance = CardInstance(
-                        printing_id=printing.id,
-                        is_foil=parsed_data['is_foil']
-                    )
-                    self.session.add(instance)
-                    successful_instances.append(instance)
-
-                print(f"Prepared {parsed_data['quantity']}x '{printing.oracle_card.name}' for addition.")
-
-            except (InvalidInputFormatError, CardNotFoundError) as e:
-                print(f"Skipping line due to error: '{line}' -> {e.message}")
+            except InvalidInputFormatError as e:
+                print(f"Skipping line due to parsing error: '{line}' -> {e.message}")
                 failed_lines.append(line)
-            # Note: We do NOT catch generic Exception, as that might hide a real database problem.
 
-        return {"successes": successful_instances, "failures": failed_lines}
+        if not unique_printings_to_find:
+            return {"successes": [], "failures": failed_lines}
+
+        # --- REFACTOR START: Query the DB in chunks to avoid SQLite variable limits ---
+
+        # 2. Perform bulk queries in chunks to get all existing printings from our DB cache.
+        printings_cache = {}
+        keys_to_query = list(unique_printings_to_find)
+        # SQLite's default variable limit is 999. Each tuple uses 2 variables.
+        # A chunk size of 400 (800 variables) is safely under this limit.
+        CHUNK_SIZE = 400
+
+        print(f"Preparing to query the local cache for {len(keys_to_query)} unique printings...")
+
+        for i in range(0, len(keys_to_query), CHUNK_SIZE):
+            chunk = keys_to_query[i:i + CHUNK_SIZE]
+
+            found_printings_query = self.session.query(CardPrinting).options(
+                joinedload(CardPrinting.oracle_card)
+            ).filter(
+                tuple_(CardPrinting.set_code, CardPrinting.collector_number).in_(chunk)
+            )
+
+            # Update the main cache with the results from this chunk
+            for p in found_printings_query.all():
+                printings_cache[(p.set_code, p.collector_number)] = p
+
+        # --- REFACTOR END ---
+
+        print(f"Found {len(printings_cache)} of {len(unique_printings_to_find)} required printings in local cache.")
+
+        # 3. Identify which printings are missing and fetch only those from Scryfall.
+        missing_printings_keys = unique_printings_to_find - set(printings_cache.keys())
+
+        if missing_printings_keys:
+            print(f"Fetching {len(missing_printings_keys)} missing printings from Scryfall...")
+            for set_code, collector_number in missing_printings_keys:
+                try:
+                    printing = self.scryfall_client.get_printing_by_set_and_number(
+                        set_code=set_code,
+                        collector_number=collector_number
+                    )
+                    # Add newly fetched printing to our cache for the next step
+                    printings_cache[(set_code, collector_number)] = printing
+                except CardNotFoundError as e:
+                    # This specific printing could not be found by Scryfall.
+                    # We'll mark all lines that needed it as failed in the next step.
+                    print(
+                        f"Scryfall API Error: Could not find printing for {set_code.upper()} #{collector_number}: {e.message}")
+                    pass  # The printing will simply be absent from the cache
+
+        # 4. Re-iterate through the successfully parsed lines, validate, and create instances.
+        for line, parsed in parsed_data_map.items():
+            if line in failed_lines:  # Skip lines that already failed parsing
+                continue
+
+            lookup_key = (parsed['set_code'], parsed['collector_number'])
+            printing = printings_cache.get(lookup_key)
+
+            if not printing:
+                print(
+                    f"Skipping line due to error: '{line}' -> Card data could not be found for {lookup_key[0].upper()} #{lookup_key[1]}")
+                failed_lines.append(line)
+                continue
+
+            # Robustness Check: Ensure the printing is linked to an oracle card.
+            if not printing.oracle_card:
+                print(
+                    f"Skipping line due to data integrity error: '{line}' -> Printing {lookup_key[0].upper()} #{lookup_key[1]} exists but is not linked to a parent card.")
+                failed_lines.append(line)
+                continue
+
+            # Perform the name validation.
+            user_provided_name = parsed['name']
+            scryfall_card_name = printing.oracle_card.name.lower()
+            if user_provided_name.lower() not in scryfall_card_name:
+                print(
+                    f"Skipping line due to name mismatch: '{line}' -> User name '{user_provided_name}' does not match found card '{printing.oracle_card.name}'")
+                failed_lines.append(line)
+                continue
+
+            # If all checks pass, create the instances.
+            for _ in range(parsed['quantity']):
+                instance = CardInstance(
+                    printing_id=printing.id,
+                    is_foil=parsed['is_foil']
+                )
+                self.session.add(instance)
+                successful_instances.append(instance)
+
+            print(f"Prepared {parsed['quantity']}x '{printing.oracle_card.name}' for addition.")
+
+        return {"successes": successful_instances, "failures": sorted(list(set(failed_lines)))}
 
     def view_collection_summary(self, filters: dict = None) -> list:
         """
@@ -205,7 +290,7 @@ class CollectionRepository:
             .all()
         )
         return summary
-    
+
     def get_instances_by_oracle_name(self, name: str) -> list:
         """
         Finds all physical CardInstances for a given abstract card name.
@@ -265,11 +350,11 @@ class CollectionRepository:
                     instance_id=instance.id,
                     deck_name=instance.deck.name
                 )
-            
+
             self.session.delete(instance)
             print(f"Successfully deleted card instance {instance_id}.")
             return True
-        
+
         raise CardNotFoundError(identifier=f"Instance ID {instance_id}")
 
     def update_card_instance(self, instance_id: int, update_data: dict) -> CardInstance:
