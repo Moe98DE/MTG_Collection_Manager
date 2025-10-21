@@ -133,6 +133,34 @@ class MagicCardService:
 
         return results
 
+    def get_all_card_instances(self) -> List[CardInstanceDetailDTO]:
+        """
+        Retrieves all card instances in the user's collection,
+        returning a list of DTOs.
+        """
+        instances = self.collection_repo.get_all_card_instances()
+        dtos = []
+        for instance in instances:
+            # --- DTO Translation Logic ---
+            status = "✅ Available"
+            if instance.deck:
+                status = f"⚠️ In '{instance.deck.name}'"
+
+            dto = CardInstanceDetailDTO(
+                instance_id=instance.id,
+                oracle_id=instance.printing.oracle_card.id,
+                card_name=instance.printing.oracle_card.name,
+                set_code=instance.printing.set_code.upper(),
+                collector_number=instance.printing.collector_number,
+                is_foil=instance.is_foil,
+                condition=instance.condition,
+                purchase_price=instance.purchase_price,
+                date_added=instance.date_added.isoformat(),
+                status=status
+            )
+            dtos.append(dto)
+        return dtos
+
     def close_session(self):
         """Closes the database session. Should be called on application exit."""
         self.db_session.close()

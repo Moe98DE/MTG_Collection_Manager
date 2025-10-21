@@ -1,6 +1,6 @@
 import re
 from typing import List, Dict
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, case
 
 from core.exceptions import InvalidInputFormatError, InstanceAlreadyAllocatedError, CardNotFoundError
@@ -222,7 +222,22 @@ class CollectionRepository:
             .all()
         )
         return query_result
-    
+
+    def get_all_card_instances(self) -> List[CardInstance]:
+        """Retrieves all card instances, correctly joined for sorting."""
+        return (
+            self.session.query(CardInstance)
+            .join(CardInstance.printing)  # Explicit join from CardInstance to CardPrinting
+            .join(CardPrinting.oracle_card)  # <-- ADD THIS JOIN
+            .order_by(
+                CardInstance.date_added.desc(),
+                OracleCard.name,  # <-- FIX THIS REFERENCE
+                CardPrinting.set_code,
+                CardPrinting.collector_number
+            )
+            .all()
+        )
+
     def get_assembled_deck_contents(self, deck_id: int) -> list:
         """
         Gets a summary of cards in an assembled deck, grouped by name.
