@@ -464,7 +464,7 @@ def get_deck_buy_list(deck_id: int = Path(..., description="The ID of the deck."
     analysis = service.get_deck_blueprint_analysis(deck_id)
     buy_list = []
     for card in analysis:
-        if card.status in [BlueprintCardStatus.MISSING, BlueprintCardStatus.PARTIAL]:
+        if card.status in [BlueprintCardStatus.MISSING, BlueprintCardStatus.PARTIALLY_OWNED]:
             to_buy = card.quantity_needed - card.available_owned
             if to_buy > 0:
                 buy_list.append(f"{to_buy} {card.card_name}")
