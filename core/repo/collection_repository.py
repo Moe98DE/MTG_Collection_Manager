@@ -262,7 +262,7 @@ class CollectionRepository:
             elif op == '=':
                 query = query.filter(OracleCard.cmc == val)
 
-        selected_colors = filters.get('colors', [])
+        selected_colors = filters.get('color_identity', [])
         if selected_colors:
             for color in ['W', 'U', 'B', 'R', 'G']:
                 if color not in selected_colors:
